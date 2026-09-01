@@ -2,7 +2,6 @@ name: Build RealiTLScanner
 
 on:
   workflow_dispatch:
-
   push:
     tags:
       - 'v*'
@@ -10,10 +9,26 @@ on:
 permissions:
   contents: write
 
-jobs:
-  build:
-    runs-on: ubuntu-latest
+concurrency:
+  group: release-${{ github.ref_name }}
+  cancel-in-progress: false
 
+jobs:
+  # Linux / Windows：单台 ubuntu 交叉编译，省时省钱
+  build-cross:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+            ext: ""
+          - goos: linux
+            goarch: arm64
+            ext: ""
+          - goos: windows
+            goarch: amd64
+            ext: ".exe"
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -26,62 +41,79 @@ jobs:
 
       - name: Build
         shell: bash
+        env:
+          CGO_ENABLED: 0
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
         run: |
           set -e
-
           mkdir -p dist
-
-          # Linux AMD64
-          echo "Building Linux AMD64..."
-          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
-            go build -trimpath -ldflags="-s -w" \
-            -o RealiTLScanner .
-
-          chmod +x RealiTLScanner
-          zip -j dist/RealiTLScanner-linux-amd64.zip RealiTLScanner
-          rm RealiTLScanner
-
-          # Linux ARM64
-          echo "Building Linux ARM64..."
-          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 \
-            go build -trimpath -ldflags="-s -w" \
-            -o RealiTLScanner .
-
-          chmod +x RealiTLScanner
-          zip -j dist/RealiTLScanner-linux-arm64.zip RealiTLScanner
-          rm RealiTLScanner
-
-          # Windows AMD64
-          echo "Building Windows AMD64..."
-          CGO_ENABLED=0 GOOS=windows GOARCH=amd64 \
-            go build -trimpath -ldflags="-s -w" \
-            -o RealiTLScanner.exe .
-
-          zip -j dist/RealiTLScanner-windows-amd64.zip RealiTLScanner.exe
-          rm RealiTLScanner.exe
-
-          # macOS Apple Silicon
-          echo "Building macOS ARM64..."
-          CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 \
-            go build -trimpath -ldflags="-s -w" \
-            -o RealiTLScanner .
-
-          chmod +x RealiTLScanner
-          zip -j dist/RealiTLScanner-darwin-arm64.zip RealiTLScanner
-          rm RealiTLScanner
-
-          echo ""
-          echo "Build completed:"
+          go build -trimpath -ldflags="-s -w" -o RealiTLScanner${{ matrix.ext }} .
+          chmod +x RealiTLScanner${{ matrix.ext }} || true
+          zip -j dist/RealiTLScanner-${{ matrix.goos }}-${{ matrix.goarch }}.zip RealiTLScanner${{ matrix.ext }}
+          sha256sum dist/*.zip > dist/RealiTLScanner-${{ matrix.goos }}-${{ matrix.goarch }}.zip.sha256
           ls -lh dist/
 
-      - name: Upload artifacts
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: RealiTLScanner-builds
-          path: dist/
+          name: RealiTLScanner-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/*
+
+  # macOS：真机 Apple Silicon (M芯片) 原生编译
+  build-macos:
+    runs-on: macos-15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.21'
+          cache: true
+
+      - name: Verify runner architecture
+        run: uname -m   # 期望输出 arm64
+
+      - name: Build
+        shell: bash
+        env:
+          CGO_ENABLED: 0
+          GOOS: darwin
+          GOARCH: arm64
+        run: |
+          set -e
+          mkdir -p dist
+          go build -trimpath -ldflags="-s -w" -o RealiTLScanner .
+          chmod +x RealiTLScanner
+          zip -j dist/RealiTLScanner-darwin-arm64.zip RealiTLScanner
+          shasum -a 256 dist/RealiTLScanner-darwin-arm64.zip > dist/RealiTLScanner-darwin-arm64.zip.sha256
+          ls -lh dist/
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: RealiTLScanner-darwin-arm64
+          path: dist/*
+
+  # 汇总四个平台的产物，统一发布到同一个 Release
+  release:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [build-cross, build-macos]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: RealiTLScanner-*
+          merge-multiple: true
+
+      - name: Show downloaded files
+        run: ls -lh dist/
 
       - name: Create Release
-        if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
           files: dist/*
